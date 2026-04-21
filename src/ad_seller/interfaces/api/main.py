@@ -12,6 +12,7 @@ Provides endpoints for:
 
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
 
@@ -64,29 +65,40 @@ app = FastAPI(
 # Lifecycle: start/stop background services
 # =============================================================================
 
+_mcp_server_ref = None
 
-@app.on_event("startup")
-async def _startup():
-    from ...services.inventory_sync_scheduler import start_sync_scheduler
+
+@asynccontextmanager
+async def lifespan(application):
+    """Manage app lifecycle — inventory sync + MCP session manager."""
+    from ...services.inventory_sync_scheduler import start_sync_scheduler, stop_sync_scheduler
 
     start_sync_scheduler()
 
-    # Mount MCP SSE server for Claude Desktop / ChatGPT
+    # Mount MCP server with both transports:
+    # - Streamable HTTP at /mcp (current MCP standard, protocol 2025-06-18)
+    # - HTTP+SSE at /mcp-sse (deprecated, kept for backwards compat)
+    # Starlette doesn't call mounted sub-app lifespans, so we must run the
+    # session manager ourselves to keep its task group alive.
+    global _mcp_server_ref
     try:
         from ..mcp_server import mcp as mcp_server
 
-        mcp_sse_app = mcp_server.sse_app()
-        app.mount("/mcp", mcp_sse_app)
-        logger.info("MCP SSE server mounted at /mcp/sse")
+        _mcp_server_ref = mcp_server
+        application.mount("/mcp", mcp_server.streamable_http_app())
+        application.mount("/mcp-sse", mcp_server.sse_app())
+        logger.info("MCP server mounted: Streamable HTTP at /mcp, legacy SSE at /mcp-sse/sse")
+
+        async with mcp_server.session_manager.run():
+            yield
     except Exception as e:
-        logger.warning("MCP SSE server not mounted: %s", e)
+        logger.warning("MCP server not mounted: %s", e)
+        yield
+    finally:
+        stop_sync_scheduler()
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    from ...services.inventory_sync_scheduler import stop_sync_scheduler
-
-    stop_sync_scheduler()
+app.router.lifespan_context = lifespan
 
 
 # =============================================================================
@@ -392,7 +404,7 @@ async def list_products():
     from ...flows import ProductSetupFlow
 
     flow = ProductSetupFlow()
-    await flow.kickoff()
+    await flow.kickoff_async()
 
     products = []
     for product in flow.state.products.values():
@@ -417,7 +429,7 @@ async def get_product(product_id: str):
     from ...flows import ProductSetupFlow
 
     flow = ProductSetupFlow()
-    await flow.kickoff()
+    await flow.kickoff_async()
 
     product = flow.state.products.get(product_id)
     if not product:
@@ -446,7 +458,7 @@ async def get_pricing(
 
     # Get products
     flow = ProductSetupFlow()
-    await flow.kickoff()
+    await flow.kickoff_async()
 
     product = flow.state.products.get(request.product_id)
     if not product:
@@ -498,7 +510,7 @@ async def submit_proposal(
 
     # Get products
     setup_flow = ProductSetupFlow()
-    await setup_flow.kickoff()
+    await setup_flow.kickoff_async()
 
     # Enforce agent registry
     _, max_tier = await _resolve_and_enforce_agent(request.agent_url)
@@ -613,7 +625,7 @@ async def discovery_query(
 
     # Get products
     setup_flow = ProductSetupFlow()
-    await setup_flow.kickoff()
+    await setup_flow.kickoff_async()
 
     # Enforce agent registry
     _, max_tier = await _resolve_and_enforce_agent(request.agent_url)
@@ -1415,7 +1427,7 @@ async def sync_packages():
     from ...flows import ProductSetupFlow
 
     flow = ProductSetupFlow()
-    await flow.kickoff()
+    await flow.kickoff_async()
 
     await emit_event(
         event_type=EventType.PACKAGE_SYNCED,
@@ -1578,7 +1590,7 @@ async def agent_card():
     inventory_types = set()
     try:
         flow = ProductSetupFlow()
-        await flow.kickoff()
+        await flow.kickoff_async()
         for product in flow.state.products.values():
             inventory_types.add(product.inventory_type)
     except Exception:
@@ -1828,7 +1840,7 @@ async def create_quote(
 
     # Get product catalog
     setup_flow = ProductSetupFlow()
-    await setup_flow.kickoff()
+    await setup_flow.kickoff_async()
 
     product = setup_flow.state.products.get(request.product_id)
     if not product:
@@ -2830,7 +2842,7 @@ async def create_deal_from_template(
 
     # Get product catalog
     setup_flow = ProductSetupFlow()
-    await setup_flow.kickoff()
+    await setup_flow.kickoff_async()
 
     product = setup_flow.state.products.get(request.product_id)
     if not product:
@@ -4158,7 +4170,7 @@ async def create_curated_deal(request: CuratedDealRequest):
     base_cpm = 12.0  # Default
     if request.product_id:
         setup_flow = ProductSetupFlow()
-        await setup_flow.kickoff()
+        await setup_flow.kickoff_async()
         product = setup_flow.state.products.get(request.product_id)
         if product:
             base_cpm = product.base_cpm
